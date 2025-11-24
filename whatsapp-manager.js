@@ -9,8 +9,19 @@ class WhatsAppManager {
   constructor() {
     this.clients = new Map();
     this.qrCodes = new Map();
+    this.processedMessages = new Map(); // Cache para deduplicação
     console.log('📱 WhatsAppManager initialized');
     console.log(`🔗 Backend URL: ${BACKEND_URL}`);
+    
+    // Limpar cache de mensagens antigas a cada 5 minutos
+    setInterval(() => {
+      const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+      for (const [msgId, timestamp] of this.processedMessages.entries()) {
+        if (timestamp < fiveMinutesAgo) {
+          this.processedMessages.delete(msgId);
+        }
+      }
+    }, 60000); // Check every minute
   }
 
   getClient(userId) {
@@ -82,6 +93,16 @@ class WhatsAppManager {
 
   async _handleMessage(msg, userId) {
     try {
+      // Deduplicação: Verificar se já processamos esta mensagem
+      const msgId = msg.id._serialized;
+      if (this.processedMessages.has(msgId)) {
+        console.log(`⏩ Skipping duplicate message: ${msgId}`);
+        return;
+      }
+      
+      // Marcar como processada
+      this.processedMessages.set(msgId, Date.now());
+      
       console.log(`\n📩 Message received for user ${userId}:`);
       console.log(`   From: ${msg.from}`);
       console.log(`   Type: ${msg.type}`);
@@ -97,6 +118,9 @@ class WhatsAppManager {
         else if (msg.type === 'ptt' || msg.type === 'audio') messageType = 'audio';
         else if (msg.type === 'document') messageType = 'document';
         else messageType = 'document';
+      } else if (msg.type === 'ptt' || msg.type === 'audio') {
+        // Áudio sem mídia (bug do whatsapp-web.js às vezes)
+        messageType = 'audio';
       }
 
       const webhookData = {
