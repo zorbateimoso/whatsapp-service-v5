@@ -107,7 +107,8 @@ class WhatsAppManager {
         sender_name: contact.pushname || contact.name || 'Usuário',
         timestamp: new Date().toISOString(),
         type: messageType,
-        text: msg.body || null
+        text: msg.body || null,
+        validation_required: true  // Always require validation for new uploads
       };
 
       if (msg.hasMedia) {
