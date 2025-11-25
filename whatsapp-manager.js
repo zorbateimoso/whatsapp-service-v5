@@ -121,8 +121,21 @@ class WhatsAppManager {
       console.log(`   Text: ${msg.body ? msg.body.substring(0, 50) : 'N/A'}`);
       console.log(`   Has Media: ${msg.hasMedia}`);
 
-      const contact = await msg.getContact();
-      const chat = await msg.getChat();
+      // Get contact and chat with error handling
+      let contact = null;
+      let chat = null;
+      
+      try {
+        contact = await msg.getContact();
+      } catch (contactError) {
+        console.log('⚠️ Could not get contact info, using fallback');
+      }
+      
+      try {
+        chat = await msg.getChat();
+      } catch (chatError) {
+        console.log('⚠️ Could not get chat info, using fallback');
+      }
       
       let messageType = 'text';
       if (msg.hasMedia) {
@@ -137,10 +150,10 @@ class WhatsAppManager {
 
       const webhookData = {
         user_id: userId,
-        group_name: chat.name || contact.pushname || 'WhatsApp',
+        group_name: (chat && chat.name) || (contact && contact.pushname) || 'WhatsApp',
         group_id: msg.from,
         sender: msg.author || msg.from,
-        sender_name: contact.pushname || contact.name || 'Usuário',
+        sender_name: (contact && (contact.pushname || contact.name)) || 'Usuário',
         timestamp: new Date().toISOString(),
         type: messageType,
         text: msg.body || null,
