@@ -4,12 +4,15 @@ const axios = require('axios');
 
 const BACKEND_URL = process.env.BACKEND_URL || 'https://buildboss-1.preview.emergentagent.com';
 const REQUEST_TIMEOUT = 60000;
+const POLLING_INTERVAL = 3000; // Poll every 3 seconds
 
 class WhatsAppManager {
   constructor() {
     this.clients = new Map();
     this.qrCodes = new Map();
     this.processedMessages = new Map(); // Cache para deduplicação
+    this.sentValidations = new Map(); // Track sent validation messages to avoid duplicates
+    this.pollingIntervals = new Map(); // Track polling intervals per group
     console.log('📱 WhatsAppManager initialized');
     console.log(`🔗 Backend URL: ${BACKEND_URL}`);
     
@@ -19,6 +22,13 @@ class WhatsAppManager {
       for (const [msgId, timestamp] of this.processedMessages.entries()) {
         if (timestamp < fiveMinutesAgo) {
           this.processedMessages.delete(msgId);
+        }
+      }
+      // Limpar validações enviadas antigas (após 1 hora)
+      const oneHourAgo = Date.now() - (60 * 60 * 1000);
+      for (const [validationId, timestamp] of this.sentValidations.entries()) {
+        if (timestamp < oneHourAgo) {
+          this.sentValidations.delete(validationId);
         }
       }
     }, 60000); // Check every minute
@@ -84,6 +94,8 @@ class WhatsAppManager {
       console.log(`⚠️ WhatsApp disconnected for user ${userId}:`, reason);
       this.clients.delete(userId);
       this.qrCodes.delete(userId);
+      // Stop all polling for this user's groups
+      this._stopAllPollingForUser(userId);
     });
 
     client.on('message', async (msg) => {
@@ -171,6 +183,9 @@ class WhatsAppManager {
         console.log('ℹ️  No reply message from backend');
       }
 
+      // Start polling for this group to catch pending validations
+      this._startPollingForGroup(userId, msg.from);
+
     } catch (error) {
       console.error('❌ Error processing message:');
       console.error('   Message:', error.message);
@@ -183,6 +198,117 @@ class WhatsAppManager {
         await msg.reply('❌ Desculpe, ocorreu um erro ao processar sua mensagem. Tente novamente em alguns instantes.');
       } catch (replyError) {
         console.error('❌ Error sending error message:', replyError.message);
+      }
+    }
+  }
+
+  _startPollingForGroup(userId, groupId) {
+    const pollingKey = `${userId}:${groupId}`;
+    
+    // Se já existe polling para este grupo, não iniciar outro
+    if (this.pollingIntervals.has(pollingKey)) {
+      console.log(`⏩ Polling already active for ${pollingKey}`);
+      return;
+    }
+
+    console.log(`🔄 Starting polling for group: ${groupId}`);
+    
+    const intervalId = setInterval(async () => {
+      try {
+        await this._pollPendingMessages(userId, groupId);
+      } catch (error) {
+        console.error(`❌ Error in polling for ${groupId}:`, error.message);
+      }
+    }, POLLING_INTERVAL);
+
+    this.pollingIntervals.set(pollingKey, intervalId);
+
+    // Auto-stop polling after 10 minutes of inactivity (no pending messages)
+    setTimeout(() => {
+      this._stopPollingForGroup(userId, groupId);
+    }, 10 * 60 * 1000);
+  }
+
+  _stopPollingForGroup(userId, groupId) {
+    const pollingKey = `${userId}:${groupId}`;
+    const intervalId = this.pollingIntervals.get(pollingKey);
+    
+    if (intervalId) {
+      clearInterval(intervalId);
+      this.pollingIntervals.delete(pollingKey);
+      console.log(`🛑 Stopped polling for group: ${groupId}`);
+    }
+  }
+
+  _stopAllPollingForUser(userId) {
+    const keysToDelete = [];
+    for (const [key, intervalId] of this.pollingIntervals.entries()) {
+      if (key.startsWith(`${userId}:`)) {
+        clearInterval(intervalId);
+        keysToDelete.push(key);
+      }
+    }
+    keysToDelete.forEach(key => this.pollingIntervals.delete(key));
+    console.log(`🛑 Stopped all polling for user: ${userId}`);
+  }
+
+  async _pollPendingMessages(userId, groupId) {
+    const client = this.clients.get(userId);
+    if (!client) {
+      console.log(`⚠️ No client found for user ${userId}, stopping polling`);
+      this._stopPollingForGroup(userId, groupId);
+      return;
+    }
+
+    try {
+      const response = await axios.get(
+        `${BACKEND_URL}/api/whatsapp/pending-messages/${groupId}`,
+        { timeout: 10000 }
+      );
+
+      const { has_messages, messages } = response.data;
+
+      if (!has_messages || !messages || messages.length === 0) {
+        return; // No pending messages, continue polling
+      }
+
+      console.log(`📬 Found ${messages.length} pending messages for group ${groupId}`);
+
+      // Send each pending message
+      for (const messageData of messages) {
+        const { validation_id, message } = messageData;
+        
+        // Check if we already sent this validation
+        if (this.sentValidations.has(validation_id)) {
+          console.log(`⏩ Skipping already sent validation: ${validation_id}`);
+          continue;
+        }
+
+        try {
+          // Send the message to the group
+          await client.sendMessage(groupId, message);
+          
+          // Mark as sent
+          this.sentValidations.set(validation_id, Date.now());
+          
+          console.log(`✅ Sent pending validation message: ${validation_id}`);
+          
+          // Small delay between messages to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
+        } catch (sendError) {
+          console.error(`❌ Error sending pending message ${validation_id}:`, sendError.message);
+        }
+      }
+
+    } catch (error) {
+      if (error.code === 'ECONNABORTED') {
+        console.log(`⏱️ Polling timeout for ${groupId} (backend may be busy)`);
+      } else if (error.response?.status === 404) {
+        console.log(`⚠️ Group ${groupId} not found, stopping polling`);
+        this._stopPollingForGroup(userId, groupId);
+      } else {
+        console.error(`❌ Error polling pending messages for ${groupId}:`, error.message);
       }
     }
   }
@@ -251,6 +377,7 @@ class WhatsAppManager {
         await client.destroy();
         this.clients.delete(userId);
         this.qrCodes.delete(userId);
+        this._stopAllPollingForUser(userId);
         console.log(`✅ User ${userId} logged out`);
       } catch (error) {
         console.error(`❌ Error logging out user ${userId}:`, error);
@@ -261,6 +388,14 @@ class WhatsAppManager {
 
   async destroy() {
     console.log('🛑 Destroying all WhatsApp clients...');
+    
+    // Stop all polling
+    for (const [key, intervalId] of this.pollingIntervals.entries()) {
+      clearInterval(intervalId);
+    }
+    this.pollingIntervals.clear();
+    
+    // Destroy all clients
     for (const [userId, client] of this.clients.entries()) {
       try {
         await client.destroy();
